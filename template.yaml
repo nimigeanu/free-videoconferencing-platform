@@ -1,0 +1,373 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template to deploy and configure a livekit videoconference server and client
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: A domain name for which you have full DNS access; the server will be hosted on a subdomain derived from this domain, named after the stack name.
+  IsRoute53Managed:
+    Description: "Is the domain managed by Route 53? (yes or no)"
+    Type: String
+    AllowedValues: 
+      - "yes"
+      - "no"
+    Default: "yes"
+  InstanceType:
+    Description: Server Instance Type. Larger instances will be able to accomodate more users
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge, t3.2xlarge]
+
+Conditions:
+  IsRoute53ManagedCondition:
+    Fn::Equals: [!Ref IsRoute53Managed, "yes"]
+  IsNotRoute53ManagedCondition:
+    Fn::Not: 
+      - Condition: IsRoute53ManagedCondition
+
+Mappings:
+  RegionMap:
+    cn-north-1:
+      AMI: ami-0826c344888bfae91
+    af-south-1:
+      AMI: ami-00086bccde71435e9
+    eu-south-1:
+      AMI: ami-09226be3427ee13b2
+    ca-central-1:
+      AMI: ami-052ce36867ee394c0
+    eu-west-1:
+      AMI: ami-00ac4b31e9cd46b3d
+    eu-central-1:
+      AMI: ami-0889b7fa27f59872b
+    me-central-1:
+      AMI: ami-035b1ffb450e56f34
+    eu-north-1:
+      AMI: ami-0354c60d72456b6cd
+    il-central-1:
+      AMI: ami-0fc87509b5e3eeba6
+    us-west-1:
+      AMI: ami-07ccf4fca609d57c0
+    ap-south-1:
+      AMI: ami-084afc54599da97f2
+    sa-east-1:
+      AMI: ami-0120f1c908b91e667
+    me-south-1:
+      AMI: ami-0ecf1c3d2b5df099f
+    ca-west-1:
+      AMI: ami-0e7df8b17ebaaac06
+    ap-southeast-1:
+      AMI: ami-050c7346cc313e8ad
+    ap-east-1:
+      AMI: ami-034f819239fa101a6
+    ap-northeast-1:
+      AMI: ami-0dd91ec2e1cacefe0
+    us-east-1:
+      AMI: ami-087ae2c33ef6846c9
+    cn-northwest-1:
+      AMI: ami-0de17bd49950318d9
+    eu-south-2:
+      AMI: ami-0128bbb233d9c13da
+    eu-central-2:
+      AMI: ami-09adb991c906a5bdc
+    ap-south-2:
+      AMI: ami-0bcdb8ecfa4381c6b
+    eu-west-2:
+      AMI: ami-07e0ad8f78f635e60
+    us-west-2:
+      AMI: ami-0cdf94b25a9dc61db
+    ap-northeast-2:
+      AMI: ami-095264d8e1cde7af3
+    ap-southeast-2:
+      AMI: ami-05c4a203768114447
+    us-east-2:
+      AMI: ami-04a936fe0a7fb8b40
+    ap-northeast-3:
+      AMI: ami-072e48bc04f08870c
+    eu-west-3:
+      AMI: ami-016e0ff53d5961634
+    ap-southeast-3:
+      AMI: ami-05eb75835181f3ce2
+    ap-southeast-4:
+      AMI: ami-0d5cc346f9c55bdbf
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      RoleName: !Sub "${AWS::StackName}-LambdaExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaBasicExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - route53:ListHostedZonesByName
+                Resource: "*"
+
+  GetHostedZoneIdFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsRoute53ManagedCondition
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          const response = require('cfn-response');
+          const { Route53 } = require('@aws-sdk/client-route-53');
+          const route53 = new Route53();
+
+
+          exports.handler = async (event, context) => {
+              const domainName = event.ResourceProperties.DomainName;
+
+              const hostedZones = await route53.listHostedZonesByName({ DNSName: domainName });
+              console.log("hostedZones: ", hostedZones);
+              if (!hostedZones.HostedZones.length) {
+                  throw new Error(`No hosted zone found for domain ${domainName}`);
+              }
+              var hostedZoneId = hostedZones.HostedZones[0].Id;
+              hostedZoneId = (hostedZoneId.match(/\/hostedzone\/([A-Z0-9]+)/) || [])[1];
+              console.log("returning: ", hostedZoneId)
+              await response.send(event, context, response.SUCCESS, {hostedZoneId});
+              console.log("done");
+          };
+      Runtime: nodejs20.x
+
+  HostedZoneIdFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsRoute53ManagedCondition
+    Properties:
+      FunctionName: !Ref GetHostedZoneIdFunction
+      Action: lambda:InvokeFunction
+      Principal: cloudformation.amazonaws.com
+
+  HostedZoneId:
+    Type: Custom::LoadLambda
+    Condition: IsRoute53ManagedCondition
+    Properties:
+      ServiceToken: !GetAtt GetHostedZoneIdFunction.Arn
+      DomainName: !Ref DomainName
+
+  RandomStringGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          const crypto = require('crypto');
+          const response = require('cfn-response');
+
+          exports.handler = async (event, context) => {
+              try {
+                  const length = parseInt(event.ResourceProperties.Length, 10) || 12;
+                  const randomString = crypto.randomBytes(Math.ceil(length / 2)).toString('hex').slice(0, length);
+
+                  const responseData = {
+                      RandomString: randomString
+                  };
+
+                  await response.send(event, context, response.SUCCESS, responseData);
+              } catch (error) {
+                  console.log('Error generating random string: ', error);
+                  await response.send(event, context, response.FAILED);
+              }
+          };
+      Runtime: nodejs20.x
+
+  RandomStringGeneratorFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RandomStringGeneratorFunction
+      Action: lambda:InvokeFunction
+      Principal: cloudformation.amazonaws.com
+
+  LiveKitAccessKey:
+    Type: Custom::RandomString
+    Properties:
+      ServiceToken: !GetAtt RandomStringGeneratorFunction.Arn
+      Length: 15
+
+  LiveKitAccessKeyID:
+    Type: Custom::RandomString
+    Properties:
+      ServiceToken: !GetAtt RandomStringGeneratorFunction.Arn
+      Length: 45
+
+  LiveKitRoomName:
+    Type: Custom::RandomString
+    Properties:
+      ServiceToken: !GetAtt RandomStringGeneratorFunction.Arn
+      Length: 4
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.176.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Join ['', [!Ref "AWS::StackName", "-VPC" ]]
+   
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: VPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.176.10.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Public
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Public
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway  
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows ssh, rtmp and http/s connections to host
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443 
+          ToPort: 443 
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 7881
+          ToPort: 7881
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 3478
+          ToPort: 3478
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5349
+          ToPort: 5349
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 50000
+          ToPort: 60000
+          CidrIp: 0.0.0.0/0
+
+  Server:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          wget -O /tmp/setup_livekit.sh https://lostshadow.s3.amazonaws.com/free-videoconferencing-platform/livekit/setup.sh
+          chmod +x /tmp/setup_livekit.sh
+          /tmp/setup_livekit.sh ${DomainName} ${AWS::StackName} ${LiveKitAccessKey.RandomString} ${LiveKitAccessKeyID.RandomString}
+          wget -O /tmp/setup_next.sh https://lostshadow.s3.amazonaws.com/free-videoconferencing-platform/next/setup.sh
+          chmod +x /tmp/setup_next.sh
+          /tmp/setup_next.sh ${DomainName} ${AWS::StackName} ${LiveKitAccessKey.RandomString} ${LiveKitAccessKeyID.RandomString}
+      Tags: 
+        - 
+          Key: "Name"
+          Value: !Sub "${AWS::StackName}-Server"
+
+  DNSRecord1:
+    Type: AWS::Route53::RecordSet
+    Condition: IsRoute53ManagedCondition
+    Properties:
+      HostedZoneId: !GetAtt HostedZoneId.hostedZoneId
+      Name:
+        Fn::Join:
+        - "."
+        - - !Ref AWS::StackName
+          - !Ref DomainName
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt Server.PublicIp
+
+  DNSRecord2:
+    Type: AWS::Route53::RecordSet
+    Condition: IsRoute53ManagedCondition
+    Properties:
+      HostedZoneId: !GetAtt HostedZoneId.hostedZoneId
+      Name:
+        Fn::Join:
+          - "."
+          - - "turn"
+            - !Ref AWS::StackName
+            - !Ref DomainName
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt Server.PublicIp
+
+Outputs:
+  VideoConferenceLink:
+    Description: Link to Video Conference Page
+    Value: !Sub "https://${AWS::StackName}.${DomainName}/rooms/${LiveKitRoomName.RandomString}-${LiveKitRoomName.RandomString}"
+  MainSubdomainDNSInstructions:
+    Description: "Instructions for setting up DNS for the main subdomain"
+    Condition: IsNotRoute53ManagedCondition
+    Value: !Sub |
+      Please create the following A record:
+      ${AWS::StackName}.${DomainName} pointing to ${Server.PublicIp}
+
+  TurnSubdomainDNSInstructions:
+    Description: "Instructions for setting up DNS for the turn subdomain"
+    Condition: IsNotRoute53ManagedCondition
+    Value: !Sub |
+      Please create the following A record:
+      turn.${AWS::StackName}.${DomainName} pointing to ${Server.PublicIp}
