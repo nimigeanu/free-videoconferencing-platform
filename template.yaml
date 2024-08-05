@@ -312,10 +312,27 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          wget -O /tmp/setup_livekit.sh https://lostshadow.s3.amazonaws.com/free-videoconferencing-platform/livekit/setup.sh
+          # Function to retry download until successful
+          download_script() {
+              local url=$1
+              local output=$2
+              while true; do
+                  wget -O "$output" "$url"
+                  if [ $? -eq 0 ]; then
+                      break
+                  else
+                      echo "Download failed. Retrying..."
+                      sleep 1
+                  fi
+              done
+          }
+          # Download and execute setup_livekit.sh
+          download_script "https://lostshadow.s3.amazonaws.com/free-videoconferencing-platform/livekit/setup.sh" "/tmp/setup_livekit.sh"
           chmod +x /tmp/setup_livekit.sh
           /tmp/setup_livekit.sh ${DomainName} ${AWS::StackName} ${LiveKitAccessKey.RandomString} ${LiveKitAccessKeyID.RandomString}
-          wget -O /tmp/setup_next.sh https://lostshadow.s3.amazonaws.com/free-videoconferencing-platform/next/setup.sh
+
+          # Download and execute setup_next.sh
+          download_script "https://lostshadow.s3.amazonaws.com/free-videoconferencing-platform/next/setup.sh" "/tmp/setup_next.sh"
           chmod +x /tmp/setup_next.sh
           /tmp/setup_next.sh ${DomainName} ${AWS::StackName} ${LiveKitAccessKey.RandomString} ${LiveKitAccessKeyID.RandomString}
       Tags: 
